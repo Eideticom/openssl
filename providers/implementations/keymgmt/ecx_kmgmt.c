@@ -27,6 +27,157 @@
 # include <openssl/sha.h>   /* For SHA512_DIGEST_LENGTH */
 #endif
 
+#define __packed __attribute__((__packed__))
+
+enum noload_security_cmd {
+	NOLOAD_SECURITY_CMD_TRNG = 0,
+	NOLOAD_SECURITY_CMD_MUL,
+	NOLOAD_SECURITY_CMD_KEY_GEN,
+	NOLOAD_SECURITY_CMD_DSA_SIGN,
+	NOLOAD_SECURITY_CMD_DSA_VERIFY,
+	NOLOAD_SECURITY_CMD_ECDH,
+};
+
+enum noload_security_mode {
+	NOLOAD_SECURITY_MODE_NONE = -1,
+	NOLOAD_SECURITY_MODE_192 = 0,
+	NOLOAD_SECURITY_MODE_224,
+	NOLOAD_SECURITY_MODE_256,
+	NOLOAD_SECURITY_MODE_384,
+	NOLOAD_SECURITY_MODE_521,
+	NOLOAD_SECURITY_MODE_X25519,
+};
+
+#define NOLOAD_TYPE_SECURITY 7
+#define NOLOAD_SUBTYPE_SECURITY_INBI 3
+
+#define noload_strerror(msg) nlsd_strerror(msg)
+
+#include <noloadsd/noload.h>
+#include <noloadsd/noload_def.h>
+
+#include <openssl/ec.h>
+#include <openssl/obj_mac.h>
+
+struct noload_sec_cfg {
+	uint8_t cmd;
+	uint8_t mode;
+	uint8_t curve;
+	uint32_t rng_bytes; // top-most byte is ignored
+	uint8_t reserved;
+} __packed;
+
+struct sec_keygen_odata {
+	uint8_t pubX[72];
+	uint8_t pubY[72];
+	uint8_t priv[72];
+} __packed;
+
+struct sec_ecdsa_sign_idata {
+	uint8_t hash[72];
+	uint8_t priv_key[72];
+} __packed;
+
+struct sec_ecdsa_sign_odata {
+	uint8_t sigr[72];
+	uint8_t sigs[72];
+	uint8_t randk[72];
+} __packed;
+
+struct sec_ecdsa_vfy_idata {
+	uint8_t pubX[72];
+	uint8_t pubY[72];
+	uint8_t sigR[72];
+	uint8_t sigS[72];
+	uint8_t hash[72];
+} __packed;
+
+struct sec_ecdsa_vfy_odata {
+	uint8_t fail;
+	uint8_t reserved[71];
+} __packed;
+
+
+struct sec_keyexch_idata {
+	uint8_t Qx[72];
+	uint8_t Qy[72];
+	uint8_t priv[72];
+} __packed;
+
+struct sec_keyexch_odata {
+	uint8_t ss[72];
+} __packed;
+
+void *swapbytes(void *inp, size_t len);
+void noload_openssl_cleanup(void);
+enum noload_security_mode nid_to_mode(int nid);
+enum noload_security_mode ECKEY_to_mode(const EC_KEY *eckey);
+size_t alu_width_bits(enum noload_security_mode mode);
+size_t alu_width_bytes(enum noload_security_mode mode);
+int noload_ec_keygen(EC_KEY *key);
+int noload_ecdsa_sign(int type, const unsigned char *dgst, int _dgstlen,
+		      unsigned char *sig, unsigned int *siglen,
+		      const BIGNUM *kinv, const BIGNUM *rp, EC_KEY *eckey);
+int noload_ecdsa_verify(int type, const unsigned char *_dgst, int _dgstlen,
+			const unsigned char *sig, int siglen, EC_KEY *eckey);
+int noload_ecdh_compute_key(unsigned char *out, size_t *olen,
+			    const EC_POINT *peer_pub_key, const EC_KEY *key);
+
+static struct nlsd_worker *nlw = NULL;
+
+static int noload_openssl_init(void)
+{
+	struct nlsd_type type = {
+		.algo = (nlsd_le16_t){NOLOAD_TYPE_SECURITY},
+		.subtype = (nlsd_le16_t){NOLOAD_SUBTYPE_SECURITY_INBI},
+	};
+	int ret;
+
+	nlw = OPENSSL_malloc(sizeof(*nlw));
+	if (!nlw)
+		return -1;
+
+	ret = nlsd_worker_init(nlw, type);
+	if (ret)
+		return -1;
+
+	return 0;
+}
+
+static int sec_engine_noload_run_job(enum noload_security_cmd cmd,
+			      enum noload_security_mode mode, void *ibuf,
+			      size_t ilen, void *obuf, size_t olen)
+{
+	struct noload_sec_cfg cfg = {
+		.cmd = cmd,
+		.mode = mode,
+		.curve = mode,
+	};
+	ssize_t ret;
+
+	if (!nlw) {
+		ret = noload_openssl_init();
+		if (ret < 0)
+			return ret;
+	}
+
+	ret = nlsd_worker_configure(nlw, &cfg, sizeof(cfg));
+	if (ret < 0)
+		return ret;
+
+	ret = nlsd_worker_run(nlw, ibuf, ilen, obuf, olen);
+	if (ret < 0)
+		return -1;
+
+	if (ret != olen) {
+		fprintf(stderr, "Unexpected length received\n");
+		errno = EIO;
+		return -1;
+	}
+
+	return 0;
+}
+
 static OSSL_FUNC_keymgmt_new_fn x25519_new_key;
 static OSSL_FUNC_keymgmt_new_fn x448_new_key;
 static OSSL_FUNC_keymgmt_new_fn ed25519_new_key;
@@ -89,6 +240,7 @@ static void *s390x_ecd_keygen448(struct ecx_gen_ctx *gctx);
 
 static void *x25519_new_key(void *provctx)
 {
+    printf("KEYMGMT %s\n", __func__);
     if (!ossl_prov_is_running())
         return 0;
     return ossl_ecx_key_new(PROV_LIBCTX_OF(provctx), ECX_KEY_TYPE_X25519, 0,
@@ -121,6 +273,12 @@ static void *ed448_new_key(void *provctx)
 
 static int ecx_has(const void *keydata, int selection)
 {
+    printf("KEYMGMT %s\n", __func__);
+    printf("\tselection: %d\n", selection);
+    printf("\tpublic: %d\n", selection & OSSL_KEYMGMT_SELECT_PUBLIC_KEY);
+    printf("\tprivate: %d\n", selection & OSSL_KEYMGMT_SELECT_PRIVATE_KEY);
+    printf("\tparams: %d\n", selection & OSSL_KEYMGMT_SELECT_DOMAIN_PARAMETERS);
+    printf("\tother: %d\n", selection & OSSL_KEYMGMT_SELECT_OTHER_PARAMETERS);
     const ECX_KEY *key = keydata;
     int ok = 0;
 
@@ -142,6 +300,7 @@ static int ecx_has(const void *keydata, int selection)
 
 static int ecx_match(const void *keydata1, const void *keydata2, int selection)
 {
+    printf("KEYMGMT %s\n", __func__);
     const ECX_KEY *key1 = keydata1;
     const ECX_KEY *key2 = keydata2;
     int ok = 1;
@@ -190,6 +349,7 @@ static int ecx_match(const void *keydata1, const void *keydata2, int selection)
 
 static int ecx_import(void *keydata, int selection, const OSSL_PARAM params[])
 {
+    printf("KEYMGMT %s\n", __func__);
     ECX_KEY *key = keydata;
     int ok = 1;
     int include_private;
@@ -230,6 +390,7 @@ static int key_to_params(ECX_KEY *key, OSSL_PARAM_BLD *tmpl,
 static int ecx_export(void *keydata, int selection, OSSL_CALLBACK *param_cb,
                       void *cbarg)
 {
+    printf("KEYMGMT %s\n", __func__);
     ECX_KEY *key = keydata;
     OSSL_PARAM_BLD *tmpl;
     OSSL_PARAM *params = NULL;
@@ -273,6 +434,7 @@ static const OSSL_PARAM ecx_key_types[] = {
 };
 static const OSSL_PARAM *ecx_imexport_types(int selection)
 {
+    printf("KEYMGMT %s\n", __func__);
     if ((selection & OSSL_KEYMGMT_SELECT_KEYPAIR) != 0)
         return ecx_key_types;
     return NULL;
@@ -316,6 +478,9 @@ static int ed_get_params(void *key, OSSL_PARAM params[])
 
 static int x25519_get_params(void *key, OSSL_PARAM params[])
 {
+    printf("KEYMGMT %s\n", __func__);
+    for (int i = 0; params && params[i].key; i++)
+        printf("\tparam[%d]: %s\n", i, params[i].key);
     return ecx_get_params(key, params, X25519_BITS, X25519_SECURITY_BITS,
                           X25519_KEYLEN);
 }
@@ -360,6 +525,7 @@ static const OSSL_PARAM ed_gettable_params[] = {
 
 static const OSSL_PARAM *x25519_gettable_params(void *provctx)
 {
+    printf("KEYMGMT %s\n", __func__);
     return ecx_gettable_params;
 }
 
@@ -397,6 +563,8 @@ static int ecx_set_params(void *key, const OSSL_PARAM params[])
     ECX_KEY *ecxkey = key;
     const OSSL_PARAM *p;
 
+    for (int i = 0; params && params[i].key; i++)
+        printf("\tparam[%d]: %s\n", i, params[i].key);
     if (params == NULL)
         return 1;
 
@@ -424,6 +592,7 @@ static int ecx_set_params(void *key, const OSSL_PARAM params[])
 
 static int x25519_set_params(void *key, const OSSL_PARAM params[])
 {
+    printf("KEYMGMT %s\n", __func__);
     return ecx_set_params(key, params);
 }
 
@@ -454,6 +623,7 @@ static const OSSL_PARAM ed_settable_params[] = {
 
 static const OSSL_PARAM *x25519_settable_params(void *provctx)
 {
+    printf("KEYMGMT %s\n", __func__);
     return ecx_settable_params;
 }
 
@@ -496,6 +666,7 @@ static void *ecx_gen_init(void *provctx, int selection,
 static void *x25519_gen_init(void *provctx, int selection,
                              const OSSL_PARAM params[])
 {
+    printf("KEYMGMT %s\n", __func__);
     return ecx_gen_init(provctx, selection, params, ECX_KEY_TYPE_X25519);
 }
 
@@ -522,6 +693,9 @@ static int ecx_gen_set_params(void *genctx, const OSSL_PARAM params[])
     struct ecx_gen_ctx *gctx = genctx;
     const OSSL_PARAM *p;
 
+    printf("KEYMGMT %s\n", __func__);
+    for (int i = 0; params && params[i].key; i++)
+        printf("\tparam[%d]: %s\n", i, params[i].key);
     if (gctx == NULL)
         return 0;
 
@@ -568,6 +742,7 @@ static int ecx_gen_set_params(void *genctx, const OSSL_PARAM params[])
 static const OSSL_PARAM *ecx_gen_settable_params(ossl_unused void *genctx,
                                                  ossl_unused void *provctx)
 {
+    printf("KEYMGMT %s\n", __func__);
     static OSSL_PARAM settable[] = {
         OSSL_PARAM_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME, NULL, 0),
         OSSL_PARAM_utf8_string(OSSL_KDF_PARAM_PROPERTIES, NULL, 0),
@@ -597,14 +772,32 @@ static void *ecx_gen(struct ecx_gen_ctx *gctx)
         ERR_raise(ERR_LIB_PROV, ERR_R_MALLOC_FAILURE);
         goto err;
     }
-    if (RAND_priv_bytes_ex(gctx->libctx, privkey, key->keylen, 0) <= 0)
-        goto err;
+    //if (RAND_priv_bytes_ex(gctx->libctx, privkey, key->keylen, 0) <= 0)
+    //    goto err;
     switch (gctx->type) {
     case ECX_KEY_TYPE_X25519:
-        privkey[0] &= 248;
-        privkey[X25519_KEYLEN - 1] &= 127;
-        privkey[X25519_KEYLEN - 1] |= 64;
-        ossl_x25519_public_from_private(key->pubkey, privkey);
+	memset(privkey, 0, 32);
+	memset(key->pubkey, 0, 32);
+	struct sec_keygen_odata odata = {};
+	int ret;
+	printf("KEYMGMT %s\n", __func__);
+	ret = sec_engine_noload_run_job(NOLOAD_SECURITY_CMD_KEY_GEN,
+			NOLOAD_SECURITY_MODE_X25519, NULL, 0, &odata,
+			sizeof(odata));
+	if (ret) {
+		fprintf(stderr, "%s: %s\n", __func__, noload_strerror(errno));
+		return NULL;
+	}
+	memcpy(key->pubkey, odata.pubX, 32);
+	memcpy(privkey, odata.priv, 32);
+
+	char pubkey[32];
+        ossl_x25519_public_from_private(pubkey, privkey);
+	printf("\tpubkey compare=%d\n", memcmp(key->pubkey, pubkey, 32));
+
+        //privkey[0] &= 248;
+        //privkey[X25519_KEYLEN - 1] &= 127;
+        //privkey[X25519_KEYLEN - 1] |= 64;
         break;
     case ECX_KEY_TYPE_X448:
         privkey[0] &= 252;
@@ -632,6 +825,7 @@ err:
 static void *x25519_gen(void *genctx, OSSL_CALLBACK *osslcb, void *cbarg)
 {
     struct ecx_gen_ctx *gctx = genctx;
+    printf("KEYMGMT %s\n", __func__);
 
     if (!ossl_prov_is_running())
         return 0;
@@ -692,6 +886,7 @@ static void *ed448_gen(void *genctx, OSSL_CALLBACK *osslcb, void *cbarg)
 
 static void ecx_gen_cleanup(void *genctx)
 {
+    printf("KEYMGMT %s\n", __func__);
     struct ecx_gen_ctx *gctx = genctx;
 
     OPENSSL_free(gctx->propq);
@@ -702,6 +897,7 @@ void *ecx_load(const void *reference, size_t reference_sz)
 {
     ECX_KEY *key = NULL;
 
+    printf("KEYMGMT %s\n", __func__);
     if (ossl_prov_is_running() && reference_sz == sizeof(key)) {
         /* The contents of the reference is the address to our object */
         key = *(ECX_KEY **)reference;
@@ -714,6 +910,7 @@ void *ecx_load(const void *reference, size_t reference_sz)
 
 static void *ecx_dup(const void *keydata_from, int selection)
 {
+    printf("KEYMGMT %s\n", __func__);
     if (ossl_prov_is_running())
         return ossl_ecx_key_dup(keydata_from, selection);
     return NULL;
@@ -776,6 +973,7 @@ static int ecx_validate(const void *keydata, int selection, int type, size_t key
 
 static int x25519_validate(const void *keydata, int selection, int checktype)
 {
+    printf("KEYMGMT %s\n", __func__);
     return ecx_validate(keydata, selection, ECX_KEY_TYPE_X25519, X25519_KEYLEN);
 }
 
